@@ -36,6 +36,7 @@ from gateway.platforms.api_server import (
     _hermes_version,
     _redact_api_error_text,
     _request_agent_overrides,
+    body_limit_middleware,
     check_api_server_requirements,
     cors_middleware,
     security_headers_middleware,
@@ -302,7 +303,15 @@ def _make_adapter(api_key: str = "", cors_origins=None) -> APIServerAdapter:
 
 def _create_app(adapter: APIServerAdapter) -> web.Application:
     """Create the aiohttp app from the adapter (without starting the full server)."""
-    mws = [mw for mw in (cors_middleware, security_headers_middleware) if mw is not None]
+    mws = [
+        mw
+        for mw in (
+            cors_middleware,
+            body_limit_middleware,
+            security_headers_middleware,
+        )
+        if mw is not None
+    ]
     app = web.Application(middlewares=mws)
     app["api_server_adapter"] = adapter
     app.router.add_get("/health", adapter._handle_health)
@@ -982,6 +991,31 @@ class TestToolsetsEndpoint:
 
 class TestAudioTranscriptionsEndpoint:
     @pytest.mark.asyncio
+    async def test_openai_sdk_client_compatibility(self, adapter):
+        from openai import AsyncOpenAI
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            sdk = AsyncOpenAI(api_key="sdk-test", base_url=str(cli.make_url("/v1")))
+            try:
+                with patch(
+                    "tools.transcription_tools.transcribe_audio",
+                    return_value={
+                        "success": True,
+                        "transcript": "SDK transcript",
+                        "provider": "local",
+                    },
+                ):
+                    result = await sdk.audio.transcriptions.create(
+                        file=("clip.wav", b"fake audio", "audio/wav"),
+                        model="whisper-1",
+                    )
+            finally:
+                await sdk.close()
+
+        assert result.text == "SDK transcript"
+
+    @pytest.mark.asyncio
     async def test_json_response_and_request_overrides(self, adapter):
         captured = {}
 
@@ -1081,6 +1115,21 @@ class TestAudioTranscriptionsEndpoint:
             assert wrong_type.status == 400
             assert (await wrong_type.json())["error"]["code"] == "invalid_content_type"
 
+            missing_file_form = FormData()
+            missing_file_form.add_field(
+                "other",
+                b"not audio",
+                filename="other.bin",
+                content_type="application/octet-stream",
+            )
+            missing_file_form.add_field("model", "whisper-1")
+            missing_file = await cli.post(
+                "/v1/audio/transcriptions",
+                data=missing_file_form,
+            )
+            assert missing_file.status == 400
+            assert (await missing_file.json())["error"]["code"] == "missing_file"
+
             missing_model = await cli.post(
                 "/v1/audio/transcriptions",
                 data=_audio_form(),
@@ -1096,6 +1145,23 @@ class TestAudioTranscriptionsEndpoint:
             assert (
                 await invalid_format.json()
             )["error"]["code"] == "invalid_response_format"
+
+    @pytest.mark.asyncio
+    async def test_rejects_audio_over_upload_limit(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(
+                "gateway.platforms.api_server.MAX_AUDIO_UPLOAD_BYTES",
+                4,
+            ):
+                resp = await cli.post(
+                    "/v1/audio/transcriptions",
+                    data=_audio_form(audio=b"too large", model="whisper-1"),
+                )
+                body = await resp.json()
+
+        assert resp.status == 413
+        assert body["error"]["code"] == "file_too_large"
 
     @pytest.mark.asyncio
     async def test_provider_failure_is_redacted_and_temp_file_is_removed(self, adapter):

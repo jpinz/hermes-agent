@@ -146,8 +146,7 @@ The default JSON response matches `client.audio.transcriptions.create()`:
 `text` returns a plain-text body. `verbose_json` returns the OpenAI-compatible
 `language`, `duration`, `text`, and `segments` fields; duration detection is
 best-effort and the unified Hermes STT pipeline does not currently provide
-segment timestamps. Audio uploads use the API server's 10 MB request-body
-limit.
+segment timestamps. Audio files may be up to 25 MB.
 
 ### POST /v1/responses
 

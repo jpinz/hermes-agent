@@ -154,6 +154,9 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8642
 MAX_STORED_RESPONSES = 100
 MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversations with tool calls
+MAX_AUDIO_UPLOAD_BYTES = 25 * 1024 * 1024
+# Leave room for multipart headers + optional fields around a max-sized file.
+MAX_AUDIO_REQUEST_BYTES = MAX_AUDIO_UPLOAD_BYTES + 1024 * 1024
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
@@ -1193,14 +1196,23 @@ if AIOHTTP_AVAILABLE:
     @web.middleware
     async def body_limit_middleware(request, handler):
         """Reject overly large request bodies early based on Content-Length."""
+        is_audio_upload = bool(re.fullmatch(
+            r"(?:/p/[^/]+)?/v1/audio/transcriptions",
+            request.path,
+        ))
+        max_request_bytes = (
+            MAX_AUDIO_REQUEST_BYTES if is_audio_upload else MAX_REQUEST_BYTES
+        )
         if request.method in {"POST", "PUT", "PATCH"}:
             cl = request.headers.get("Content-Length")
             if cl is not None:
                 try:
-                    if int(cl) > MAX_REQUEST_BYTES:
+                    if int(cl) > max_request_bytes:
                         return web.json_response(_openai_error("Request body too large.", code="body_too_large"), status=413)
                 except ValueError:
                     return web.json_response(_openai_error("Invalid Content-Length header.", code="invalid_content_length"), status=400)
+        if request.client_max_size != max_request_bytes:
+            request = request.clone(client_max_size=max_request_bytes)
         try:
             return await handler(request)
         except web.HTTPRequestEntityTooLarge:
@@ -4188,6 +4200,15 @@ class APIServerAdapter(BasePlatformAdapter):
                             if not chunk:
                                 break
                             upload_size += len(chunk)
+                            if upload_size > MAX_AUDIO_UPLOAD_BYTES:
+                                return web.json_response(
+                                    _openai_error(
+                                        "Audio file is too large (maximum 25 MB).",
+                                        param="file",
+                                        code="file_too_large",
+                                    ),
+                                    status=413,
+                                )
                             tmp.write(chunk)
                     continue
 
