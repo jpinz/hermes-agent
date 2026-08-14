@@ -4,6 +4,7 @@ OpenAI-compatible API server platform adapter.
 Exposes an HTTP server with endpoints:
 - POST /v1/chat/completions        — OpenAI Chat Completions format (stateless; opt-in session continuity via X-Hermes-Session-Id header; opt-in long-term memory scoping via X-Hermes-Session-Key header)
 - POST /v1/responses               — OpenAI Responses API format (stateful via previous_response_id; X-Hermes-Session-Key supported)
+- POST /v1/audio/transcriptions    — OpenAI Audio API transcription format
 - GET  /v1/responses/{response_id} — Retrieve a stored response
 - DELETE /v1/responses/{response_id} — Delete a stored response
 - GET  /v1/models                  — lists hermes-agent and any configured model_routes aliases
@@ -55,6 +56,7 @@ import re
 import sqlite3
 import sys
 import threading
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -157,6 +159,24 @@ MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
 RESPONSES_AUTO_TRUNCATION_HISTORY_LIMIT = 100
 _COMPRESSED_SUMMARY_METADATA_KEY = "_compressed_summary"
+_AUDIO_UPLOAD_SUFFIXES = {
+    "audio/aac": ".aac",
+    "audio/flac": ".flac",
+    "audio/mp4": ".m4a",
+    "audio/mpeg": ".mp3",
+    "audio/ogg": ".ogg",
+    "audio/opus": ".opus",
+    "audio/wav": ".wav",
+    "audio/webm": ".webm",
+    "audio/x-m4a": ".m4a",
+    "audio/x-wav": ".wav",
+    "video/mp4": ".mp4",
+    "video/webm": ".webm",
+}
+_AUDIO_UPLOAD_EXTENSIONS = frozenset({
+    ".aac", ".caf", ".flac", ".m4a", ".mp3", ".mp4", ".mpga", ".mpeg",
+    ".oga", ".ogg", ".opus", ".silk", ".wav", ".webm",
+})
 
 
 class ThreadSafeAsyncQueue(asyncio.Queue):
@@ -1098,6 +1118,15 @@ def _openai_error(message: str, err_type: str = "invalid_request_error", param: 
             "code": code,
         }
     }
+
+
+def _audio_upload_suffix(filename: Optional[str], content_type: Optional[str]) -> str:
+    """Return a bounded suffix for an uploaded audio temporary file."""
+    suffix = Path(filename or "").suffix.lower()
+    if suffix in _AUDIO_UPLOAD_EXTENSIONS:
+        return suffix
+    normalized_type = str(content_type or "").split(";", 1)[0].strip().lower()
+    return _AUDIO_UPLOAD_SUFFIXES.get(normalized_type, ".bin")
 
 
 _api_agent_request_reservation: ContextVar[Optional[dict[str, bool]]] = ContextVar(
@@ -2073,6 +2102,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("POST", "/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream),
             ("POST", "/api/sessions/{session_id}/model", self._handle_session_model_lock),
             ("POST", "/v1/chat/completions", self._handle_chat_completions),
+            ("POST", "/v1/audio/transcriptions", self._handle_audio_transcriptions),
             ("POST", "/v1/responses", self._handle_responses),
             ("GET", "/v1/responses/{response_id}", self._handle_get_response),
             ("DELETE", "/v1/responses/{response_id}", self._handle_delete_response),
@@ -3143,7 +3173,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "jobs_admin": False,
                 "memory_write_api": False,
                 "skills_api": True,
-                "audio_api": False,
+                "audio_api": True,
                 "realtime_voice": False,
                 "session_continuity_header": "X-Hermes-Session-Id",
                 "session_key_header": "X-Hermes-Session-Key",
@@ -3155,6 +3185,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "models": {"method": "GET", "path": "/v1/models"},
                 "model_options": {"method": "GET", "path": "/api/model/options"},
                 "chat_completions": {"method": "POST", "path": "/v1/chat/completions"},
+                "audio_transcriptions": {"method": "POST", "path": "/v1/audio/transcriptions"},
                 "responses": {"method": "POST", "path": "/v1/responses"},
                 "runs": {"method": "POST", "path": "/v1/runs"},
                 "run_status": {"method": "GET", "path": "/v1/runs/{run_id}"},
@@ -4098,6 +4129,168 @@ class APIServerAdapter(BasePlatformAdapter):
             "session_id": session_id,
             "runtime": runtime,
         })
+
+    async def _handle_audio_transcriptions(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        """POST /v1/audio/transcriptions — OpenAI Audio API format."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        temp_path = ""
+        try:
+            if request.content_type != "multipart/form-data":
+                return web.json_response(
+                    _openai_error(
+                        "Request must use multipart/form-data.",
+                        param="file",
+                        code="invalid_content_type",
+                    ),
+                    status=400,
+                )
+
+            try:
+                reader = await request.multipart()
+            except (AssertionError, ValueError):
+                return web.json_response(
+                    _openai_error(
+                        "Invalid multipart request body.",
+                        code="invalid_multipart_body",
+                    ),
+                    status=400,
+                )
+
+            fields: Dict[str, str] = {}
+            upload_size = 0
+            async for part in reader:
+                if part.name == "file":
+                    if temp_path:
+                        return web.json_response(
+                            _openai_error(
+                                "Only one 'file' field is supported.",
+                                param="file",
+                                code="duplicate_file",
+                            ),
+                            status=400,
+                        )
+                    suffix = _audio_upload_suffix(
+                        part.filename, part.headers.get("Content-Type")
+                    )
+                    with tempfile.NamedTemporaryFile(
+                        prefix="hermes-api-stt-",
+                        suffix=suffix,
+                        delete=False,
+                    ) as tmp:
+                        temp_path = tmp.name
+                        while True:
+                            chunk = await part.read_chunk(size=64 * 1024)
+                            if not chunk:
+                                break
+                            upload_size += len(chunk)
+                            tmp.write(chunk)
+                    continue
+
+                if part.name in {"model", "language", "prompt", "response_format"}:
+                    fields[part.name] = await part.text()
+                else:
+                    await part.release()
+
+            if not temp_path:
+                return web.json_response(
+                    _openai_error(
+                        "Missing required 'file' field.",
+                        param="file",
+                        code="missing_file",
+                    ),
+                    status=400,
+                )
+            if upload_size == 0:
+                return web.json_response(
+                    _openai_error(
+                        "Uploaded audio file is empty.",
+                        param="file",
+                        code="empty_file",
+                    ),
+                    status=400,
+                )
+
+            model = fields.get("model", "").strip()
+            if not model:
+                return web.json_response(
+                    _openai_error(
+                        "Missing required 'model' field.",
+                        param="model",
+                        code="missing_model",
+                    ),
+                    status=400,
+                )
+
+            language = fields.get("language", "").strip() or None
+            prompt = fields.get("prompt", "").strip() or None
+            response_format = fields.get("response_format", "json").strip().lower()
+            if response_format not in {"json", "text", "verbose_json"}:
+                return web.json_response(
+                    _openai_error(
+                        "'response_format' must be one of: json, text, verbose_json.",
+                        param="response_format",
+                        code="invalid_response_format",
+                    ),
+                    status=400,
+                )
+
+            from tools.transcription_tools import (
+                _probe_audio_duration,
+                transcribe_audio,
+            )
+
+            result = await asyncio.to_thread(
+                transcribe_audio,
+                temp_path,
+                model,
+                "api_server",
+                language=language,
+                prompt=prompt,
+            )
+            error = str(result.get("error") or "Transcription failed")
+            if not result.get("success"):
+                if result.get("no_speech") or "empty transcript" in error.lower():
+                    result = {"success": True, "transcript": ""}
+                else:
+                    return web.json_response(
+                        _openai_error(error, code="transcription_failed"),
+                        status=400,
+                    )
+
+            transcript = str(result.get("transcript") or "").strip()
+            if response_format == "text":
+                return web.Response(text=transcript, content_type="text/plain")
+            if response_format == "verbose_json":
+                duration = await asyncio.to_thread(_probe_audio_duration, temp_path)
+                return web.json_response({
+                    "language": str(result.get("language") or language or ""),
+                    "duration": float(duration or result.get("duration") or 0.0),
+                    "text": transcript,
+                    "segments": result.get("segments") or [],
+                })
+            return web.json_response({"text": transcript})
+        except web.HTTPRequestEntityTooLarge:
+            raise
+        except Exception:
+            logger.exception("[%s] POST /v1/audio/transcriptions failed", self.name)
+            return web.json_response(
+                _openai_error(
+                    "Transcription failed.",
+                    err_type="server_error",
+                    code="transcription_error",
+                ),
+                status=500,
+            )
+        finally:
+            if temp_path:
+                with suppress(OSError):
+                    os.unlink(temp_path)
+
     @_admit_api_agent_request
     async def _handle_chat_completions(self, request: "web.Request") -> "web.Response":
         """POST /v1/chat/completions — OpenAI Chat Completions format."""

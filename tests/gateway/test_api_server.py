@@ -20,10 +20,11 @@ import sys
 import time
 import types
 import uuid
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from aiohttp import web
+from aiohttp import FormData, web
 from aiohttp.test_utils import TestClient, TestServer
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
@@ -315,6 +316,7 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_post("/api/sessions/{session_id}/chat", adapter._handle_session_chat)
     app.router.add_post("/api/sessions/{session_id}/chat/stream", adapter._handle_session_chat_stream)
     app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
+    app.router.add_post("/v1/audio/transcriptions", adapter._handle_audio_transcriptions)
     app.router.add_post("/v1/responses", adapter._handle_responses)
     app.router.add_get("/v1/responses/{response_id}", adapter._handle_get_response)
     app.router.add_delete("/v1/responses/{response_id}", adapter._handle_delete_response)
@@ -323,6 +325,19 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
         adapter._handle_platform_event_callback,
     )
     return app
+
+
+def _audio_form(
+    *,
+    audio: bytes = b"fake audio",
+    filename: str = "clip.wav",
+    **fields: str,
+) -> FormData:
+    form = FormData()
+    form.add_field("file", audio, filename=filename, content_type="audio/wav")
+    for name, value in fields.items():
+        form.add_field(name, value)
+    return form
 
 
 class _FakeGoogleChatAdapter:
@@ -871,9 +886,14 @@ class TestCapabilitiesEndpoint:
             assert data["features"]["run_status"] is True
             assert data["features"]["run_events_sse"] is True
             assert data["features"]["model_options"] is True
+            assert data["features"]["audio_api"] is True
             assert data["features"]["session_continuity_header"] == "X-Hermes-Session-Id"
             assert data["endpoints"]["run_status"]["path"] == "/v1/runs/{run_id}"
             assert data["endpoints"]["model_options"] == {"method": "GET", "path": "/api/model/options"}
+            assert data["endpoints"]["audio_transcriptions"] == {
+                "method": "POST",
+                "path": "/v1/audio/transcriptions",
+            }
             assert data["endpoints"]["skills"] == {"method": "GET", "path": "/v1/skills"}
             assert data["endpoints"]["toolsets"] == {"method": "GET", "path": "/v1/toolsets"}
 
@@ -953,6 +973,178 @@ class TestToolsetsEndpoint:
             call.kwargs["features"] is feature_snapshot
             for call in has_keys.call_args_list
         )
+
+
+# ---------------------------------------------------------------------------
+# /v1/audio/transcriptions endpoint
+# ---------------------------------------------------------------------------
+
+
+class TestAudioTranscriptionsEndpoint:
+    @pytest.mark.asyncio
+    async def test_json_response_and_request_overrides(self, adapter):
+        captured = {}
+
+        def fake_transcribe(path, model=None, source=None, **kwargs):
+            captured.update({
+                "path": path,
+                "audio": Path(path).read_bytes(),
+                "model": model,
+                "source": source,
+                **kwargs,
+            })
+            return {
+                "success": True,
+                "transcript": "bonjour le monde",
+                "provider": "local",
+            }
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(
+                "tools.transcription_tools.transcribe_audio",
+                side_effect=fake_transcribe,
+            ):
+                resp = await cli.post(
+                    "/v1/audio/transcriptions",
+                    data=_audio_form(
+                        model="whisper-1",
+                        language="fr",
+                        prompt="Hermes vocabulary",
+                    ),
+                )
+                assert resp.status == 200
+                assert await resp.json() == {"text": "bonjour le monde"}
+
+        assert captured["audio"] == b"fake audio"
+        assert captured["model"] == "whisper-1"
+        assert captured["source"] == "api_server"
+        assert captured["language"] == "fr"
+        assert captured["prompt"] == "Hermes vocabulary"
+        assert not Path(captured["path"]).exists()
+
+    @pytest.mark.asyncio
+    async def test_text_and_verbose_json_responses(self, adapter):
+        app = _create_app(adapter)
+        result = {
+            "success": True,
+            "transcript": "hello world",
+            "provider": "openai",
+        }
+        async with TestClient(TestServer(app)) as cli:
+            with patch(
+                "tools.transcription_tools.transcribe_audio",
+                return_value=result,
+            ):
+                text_resp = await cli.post(
+                    "/v1/audio/transcriptions",
+                    data=_audio_form(model="whisper-1", response_format="text"),
+                )
+                assert text_resp.status == 200
+                assert text_resp.content_type == "text/plain"
+                assert await text_resp.text() == "hello world"
+
+            with (
+                patch(
+                    "tools.transcription_tools.transcribe_audio",
+                    return_value=result,
+                ),
+                patch(
+                    "tools.transcription_tools._probe_audio_duration",
+                    return_value=2.5,
+                ),
+            ):
+                verbose_resp = await cli.post(
+                    "/v1/audio/transcriptions",
+                    data=_audio_form(
+                        model="whisper-1",
+                        language="en",
+                        response_format="verbose_json",
+                    ),
+                )
+                assert verbose_resp.status == 200
+                assert await verbose_resp.json() == {
+                    "language": "en",
+                    "duration": 2.5,
+                    "text": "hello world",
+                    "segments": [],
+                }
+
+    @pytest.mark.asyncio
+    async def test_rejects_invalid_multipart_fields(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            wrong_type = await cli.post(
+                "/v1/audio/transcriptions",
+                json={"model": "whisper-1"},
+            )
+            assert wrong_type.status == 400
+            assert (await wrong_type.json())["error"]["code"] == "invalid_content_type"
+
+            missing_model = await cli.post(
+                "/v1/audio/transcriptions",
+                data=_audio_form(),
+            )
+            assert missing_model.status == 400
+            assert (await missing_model.json())["error"]["code"] == "missing_model"
+
+            invalid_format = await cli.post(
+                "/v1/audio/transcriptions",
+                data=_audio_form(model="whisper-1", response_format="srt"),
+            )
+            assert invalid_format.status == 400
+            assert (
+                await invalid_format.json()
+            )["error"]["code"] == "invalid_response_format"
+
+    @pytest.mark.asyncio
+    async def test_provider_failure_is_redacted_and_temp_file_is_removed(self, adapter):
+        captured = {}
+        secret = "sk-transcription-secret-123456789"
+
+        def fail_transcription(path, *args, **kwargs):
+            captured["path"] = path
+            return {
+                "success": False,
+                "transcript": "",
+                "error": f"OPENAI_API_KEY={secret}",
+            }
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(
+                "tools.transcription_tools.transcribe_audio",
+                side_effect=fail_transcription,
+            ):
+                resp = await cli.post(
+                    "/v1/audio/transcriptions",
+                    data=_audio_form(model="whisper-1"),
+                )
+                assert resp.status == 400
+                body = await resp.text()
+
+        assert secret not in body
+        assert not Path(captured["path"]).exists()
+
+    @pytest.mark.asyncio
+    async def test_no_speech_returns_empty_success(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(
+                "tools.transcription_tools.transcribe_audio",
+                return_value={
+                    "success": False,
+                    "transcript": "",
+                    "error": "Provider returned empty transcript",
+                    "no_speech": True,
+                },
+            ):
+                resp = await cli.post(
+                    "/v1/audio/transcriptions",
+                    data=_audio_form(model="whisper-1"),
+                )
+                assert resp.status == 200
+                assert await resp.json() == {"text": ""}
 
 
 # ---------------------------------------------------------------------------
@@ -1797,6 +1989,16 @@ class TestEndpointAuth:
             resp = await cli.post(
                 "/v1/chat/completions",
                 json={"model": "test", "messages": [{"role": "user", "content": "hi"}]},
+            )
+            assert resp.status == 401
+
+    @pytest.mark.asyncio
+    async def test_audio_transcriptions_requires_auth(self, auth_adapter):
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/audio/transcriptions",
+                data=_audio_form(model="whisper-1"),
             )
             assert resp.status == 401
 
@@ -2865,4 +3067,3 @@ class TestCreateAgentModelRecovery:
         )
         adapter._create_agent(session_id="another-session", gateway_session_key="stable-chan-1")
         assert captured[1]["model"] == "minimax/minimax-m3"
-

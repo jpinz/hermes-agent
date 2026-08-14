@@ -305,6 +305,35 @@ class TestNoHookPath:
         # a control run without the hook plumbing.
         assert kwargs == {"language": None, "prompt": None}
 
+    def test_request_hints_override_config_without_hooks(
+        self, monkeypatch, tmp_path,
+    ):
+        audio = _make_audio(tmp_path)
+        _no_hooks(monkeypatch)
+
+        backend = MagicMock(return_value={"success": True, "transcript": "bonjour"})
+        cfg_patch, prov_patch = _dispatch_ctx(
+            {
+                "provider": "openai",
+                "prompt": "configured prompt",
+                "openai": {"language": "de"},
+            },
+            "openai",
+        )
+        with cfg_patch, prov_patch, \
+             patch("tools.transcription_tools._transcribe_openai", backend):
+            transcription_tools.transcribe_audio(
+                audio,
+                model="whisper-1",
+                source="api_server",
+                language="fr",
+                prompt="request prompt",
+            )
+
+        args, kwargs = backend.call_args
+        assert args == (audio, "whisper-1")
+        assert kwargs == {"language": "fr", "prompt": "request prompt"}
+
     def test_no_hook_openai_wire_call_has_no_prompt_or_language(
         self, monkeypatch, tmp_path,
     ):

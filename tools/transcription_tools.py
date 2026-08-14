@@ -1399,18 +1399,15 @@ def _apply_pre_transcription_hook(
     the Groq/OpenAI cross-corrections) a caller-supplied model would, and
     otherwise errors at the backend as it would today.
 
-    Returns ``(model, language_override, prompt)``. ``language_override``
-    is ``None`` unless a hook explicitly set ``language`` — backends keep
-    their existing config/env language resolution when no hook overrides
-    it.
+    Returns ``(model, language, prompt)`` after applying any hook overrides.
     """
     try:
         from hermes_cli.plugins import has_hook, invoke_hook
 
-        # No-hook short-circuit: keep the no-plugin dispatch path
-        # byte-identical (no kwargs built, no invoke_hook call).
+        # No-hook short-circuit: keep the no-plugin dispatch path free of
+        # plugin work while preserving caller-supplied request overrides.
         if not has_hook("pre_transcription"):
-            return model, None, prompt
+            return model, language, prompt
 
         hook_results = invoke_hook(
             "pre_transcription",
@@ -1454,10 +1451,12 @@ def _apply_pre_transcription_hook(
             # config is the base, hooks mutate on top. An empty string
             # clears the config prompt.
             prompt = overrides["prompt"] or None
-        return model, overrides.get("language") or None, prompt
+        if "language" in overrides:
+            language = overrides["language"] or None
+        return model, language, prompt
     except Exception as _hook_err:  # noqa: BLE001 — hook plumbing is fail-open
         logger.debug("pre_transcription hook error: %s", _hook_err)
-        return model, None, prompt
+        return model, language, prompt
 
 
 # ---------------------------------------------------------------------------
@@ -2904,6 +2903,9 @@ def _transcribe_prepared_audio(
     file_path: str,
     model: Optional[str] = None,
     source: Optional[str] = None,
+    *,
+    language: Optional[str] = None,
+    prompt: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Transcribe an audio file using the configured STT provider.
@@ -2918,6 +2920,8 @@ def _transcribe_prepared_audio(
         source:    Optional caller-surface label (e.g. ``"gateway"``,
                    ``"voice_mode"``) forwarded to the ``pre_transcription``
                    plugin hook for observability. Not used for dispatch.
+        language:  Optional request-level language hint.
+        prompt:    Optional request-level vocabulary/context hint.
 
     Returns:
         dict with keys:
@@ -2978,7 +2982,15 @@ def _transcribe_prepared_audio(
             trim_cleanup_dir = os.path.dirname(trimmed)
 
     try:
-        return _dispatch_stt_provider(file_path, provider, stt_config, model, source)
+        return _dispatch_stt_provider(
+            file_path,
+            provider,
+            stt_config,
+            model,
+            source,
+            language=language,
+            prompt=prompt,
+        )
     finally:
         if trim_cleanup_dir:
             shutil.rmtree(trim_cleanup_dir, ignore_errors=True)
@@ -2990,13 +3002,23 @@ def _dispatch_stt_provider(
     stt_config: Dict[str, Any],
     model: Optional[str] = None,
     source: Optional[str] = None,
+    *,
+    language: Optional[str] = None,
+    prompt: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Route *file_path* to the handler for *provider* (built-in > command > plugin)."""
-    # Optional static transcription prompt (``stt.prompt`` in config.yaml):
-    # vocabulary/context hints threaded to prompt-capable backends.
-    # Ordering: config is the base; pre_transcription hook results mutate on
-    # top, in registration order, so the last hook to set a field wins.
-    prompt = stt_config.get("prompt")
+    # Request hints override static config; hooks may then mutate either value.
+    if not isinstance(language, str) or not language.strip():
+        language = _get_stt_section(stt_config, provider).get("language")
+    elif language:
+        language = language.strip()
+
+    # Optional static transcription prompt (``stt.prompt`` in config.yaml)
+    # supplies the base when the caller did not provide one.
+    if not isinstance(prompt, str) or not prompt.strip():
+        prompt = stt_config.get("prompt")
+    # Ordering: config is the base, request hints override config, and
+    # pre_transcription hook results mutate on top in registration order.
     if not isinstance(prompt, str) or not prompt.strip():
         prompt = None
 
@@ -3004,13 +3026,12 @@ def _dispatch_stt_provider(
     # BEFORE any backend (built-in, command-type, or plugin-registered) is
     # invoked. Hooks may mutate prompt/language/model; file_path is
     # read-only. The helper short-circuits on has_hook() so the no-hook
-    # dispatch path stays byte-identical. ``language`` stays None unless a
-    # hook overrides it — backends keep their own config/env resolution.
+    # dispatch path avoids plugin work.
     model, language, prompt = _apply_pre_transcription_hook(
         file_path=file_path,
         provider=provider,
         model=model,
-        language=_get_stt_section(stt_config, provider).get("language"),
+        language=language,
         prompt=prompt,
         source=source,
     )
@@ -3154,12 +3175,18 @@ def transcribe_audio(
     file_path: str,
     model: Optional[str] = None,
     source: Optional[str] = None,
+    *,
+    language: Optional[str] = None,
+    prompt: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Safely validate, preprocess supported inputs, and dispatch transcription.
 
     ``source`` is an optional caller-surface label (e.g. ``"gateway"``,
     ``"voice_mode"``) forwarded to the ``pre_transcription`` plugin hook for
     observability. Not used for dispatch.
+
+    ``language`` and ``prompt`` are optional request-level overrides. They take
+    precedence over static STT config and remain subject to plugin transforms.
     """
     # Refuse to feed a credential / secret store (auth.json, .env, OAuth
     # tokens, mcp-tokens/, ...) to an STT provider — before ANY validation or
@@ -3192,7 +3219,13 @@ def transcribe_audio(
         prepared_error = _validate_audio_file(prepared_path, enforce_size_limit=False)
         if prepared_error:
             return prepared_error
-        return _transcribe_prepared_audio(prepared_path, model, source)
+        return _transcribe_prepared_audio(
+            prepared_path,
+            model,
+            source,
+            language=language,
+            prompt=prompt,
+        )
     finally:
         if cleanup_dir:
             shutil.rmtree(cleanup_dir, ignore_errors=True)

@@ -104,6 +104,7 @@ Endpoints:
 
 ```
 POST /v1/chat/completions        OpenAI Chat Completions (streaming via SSE)
+POST /v1/audio/transcriptions    OpenAI Audio API transcription
 POST /v1/responses               OpenAI Responses API (stateful)
 POST /v1/runs                    Start a run, returns run_id (202)
 GET  /v1/runs/{id}               Run status
@@ -118,6 +119,10 @@ GET  /health, /health/detailed
 ```
 
 Setup, headers (`X-Hermes-Session-Id`, `X-Hermes-Session-Key`), and frontend wiring: [API Server](../user-guide/features/api-server).
+
+`POST /v1/audio/transcriptions` accepts the OpenAI multipart `file`, `model`,
+`language`, `prompt`, and `response_format` fields and uses Hermes' configured
+STT provider. It supports `json`, `text`, and `verbose_json` responses.
 
 ### Model catalog surfaces
 
