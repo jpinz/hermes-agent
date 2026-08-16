@@ -112,6 +112,42 @@ Uploaded files (`file` / `input_file` / `file_id`) and non-image `data:` URLs re
 - **Chat Completions**: Hermes emits `event: hermes.tool.progress` for tool-start visibility without polluting persisted assistant text.
 - **Responses**: Hermes emits spec-native `function_call` and `function_call_output` output items during the SSE stream, so clients can render structured tool UI in real time.
 
+### POST /v1/audio/transcriptions
+
+OpenAI-compatible speech-to-text. Send a multipart audio upload and Hermes
+routes it through the provider selected by `stt.provider` in `config.yaml` (or
+the normal STT auto-detection chain).
+
+```bash
+curl http://localhost:8642/v1/audio/transcriptions \
+  -H "Authorization: ******" \
+  -F "file=@meeting.wav" \
+  -F "model=whisper-1" \
+  -F "language=en" \
+  -F "response_format=json"
+```
+
+Multipart fields:
+
+| Field | Required | Description |
+|---|---|---|
+| `file` | Yes | Audio file supported by the configured STT provider |
+| `model` | Yes | STT model override, such as `whisper-1` |
+| `language` | No | Input-language hint |
+| `prompt` | No | Vocabulary or context hint |
+| `response_format` | No | `json` (default), `text`, or `verbose_json` |
+
+The default JSON response matches `client.audio.transcriptions.create()`:
+
+```json
+{"text": "Transcribed speech"}
+```
+
+`text` returns a plain-text body. `verbose_json` returns the OpenAI-compatible
+`language`, `duration`, `text`, and `segments` fields; duration detection is
+best-effort and the unified Hermes STT pipeline does not currently provide
+segment timestamps. Audio files may be up to 25 MB.
+
 ### POST /v1/responses
 
 OpenAI Responses API format. Supports server-side conversation state via `previous_response_id` — the server stores full conversation history (including tool calls and results) so multi-turn context is preserved without the client managing it.
@@ -658,7 +694,7 @@ In Open WebUI, add each as a separate connection. The model dropdown shows `alic
 ## Limitations
 
 - **Response storage** — stored responses (for `previous_response_id`) are persisted in SQLite and survive gateway restarts. Max 100 stored responses (LRU eviction).
-- **No file upload** — inline images are supported on both `/v1/chat/completions` and `/v1/responses`, but uploaded files (`file`, `input_file`, `file_id`) and non-image document inputs are not supported through the API.
+- **No general chat file upload** — `/v1/audio/transcriptions` accepts audio uploads, but `/v1/chat/completions` and `/v1/responses` do not support uploaded files (`file`, `input_file`, `file_id`) or non-image document inputs.
 - **Simple OpenAI clients still see an alias** — `/v1/models` advertises the
   stable Hermes alias (`hermes-agent` or the active profile name). Richer
   clients can send explicit `provider` / `model_options` overrides on requests.

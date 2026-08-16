@@ -1009,6 +1009,7 @@ def _transcribe_command_stt(
         "success": True,
         "transcript": transcript_text,
         "provider": provider_name,
+        "language": language,
     }
 
 
@@ -1399,18 +1400,15 @@ def _apply_pre_transcription_hook(
     the Groq/OpenAI cross-corrections) a caller-supplied model would, and
     otherwise errors at the backend as it would today.
 
-    Returns ``(model, language_override, prompt)``. ``language_override``
-    is ``None`` unless a hook explicitly set ``language`` — backends keep
-    their existing config/env language resolution when no hook overrides
-    it.
+    Returns ``(model, language, prompt)`` after applying any hook overrides.
     """
     try:
         from hermes_cli.plugins import has_hook, invoke_hook
 
-        # No-hook short-circuit: keep the no-plugin dispatch path
-        # byte-identical (no kwargs built, no invoke_hook call).
+        # No-hook short-circuit: keep the no-plugin dispatch path free of
+        # plugin work while preserving caller-supplied request overrides.
         if not has_hook("pre_transcription"):
-            return model, None, prompt
+            return model, language, prompt
 
         hook_results = invoke_hook(
             "pre_transcription",
@@ -1454,10 +1452,12 @@ def _apply_pre_transcription_hook(
             # config is the base, hooks mutate on top. An empty string
             # clears the config prompt.
             prompt = overrides["prompt"] or None
-        return model, overrides.get("language") or None, prompt
+        if "language" in overrides:
+            language = overrides["language"] or None
+        return model, language, prompt
     except Exception as _hook_err:  # noqa: BLE001 — hook plumbing is fail-open
         logger.debug("pre_transcription hook error: %s", _hook_err)
-        return model, None, prompt
+        return model, language, prompt
 
 
 # ---------------------------------------------------------------------------
@@ -1988,7 +1988,13 @@ def _transcribe_local(
         if idle_timeout > 0:
             _start_idle_unload_watcher(idle_timeout)
 
-        return {"success": True, "transcript": transcript, "provider": "local"}
+        return {
+            "success": True,
+            "transcript": transcript,
+            "provider": "local",
+            "language": getattr(info, "language", None) or language,
+            "duration": getattr(info, "duration", None),
+        }
 
     except Exception as e:
         logger.error("Local transcription failed: %s", e, exc_info=True)
@@ -2123,7 +2129,12 @@ def _transcribe_local_command(
                 normalized_model,
                 len(transcript_text),
             )
-            return {"success": True, "transcript": transcript_text, "provider": "local_command"}
+            return {
+                "success": True,
+                "transcript": transcript_text,
+                "provider": "local_command",
+                "language": language,
+            }
 
     except KeyError as e:
         return {
@@ -2197,7 +2208,12 @@ def _transcribe_groq(
             logger.info("Transcribed %s via Groq API (%s, lang=%s, %d chars)",
                          Path(file_path).name, model_name, language or "auto", len(transcript_text))
 
-            return {"success": True, "transcript": transcript_text, "provider": "groq"}
+            return {
+                "success": True,
+                "transcript": transcript_text,
+                "provider": "groq",
+                "language": language,
+            }
         finally:
             close = getattr(client, "close", None)
             if callable(close):
@@ -2275,7 +2291,11 @@ def _transcribe_openai(
                 create_kwargs = {
                     "model": model_name,
                     "file": audio_file,
-                    "response_format": "text" if model_name == "whisper-1" else "json",
+                    "response_format": (
+                        "verbose_json"
+                        if provider_label == "openai" and model_name == "whisper-1"
+                        else "json"
+                    ),
                 }
                 if language:
                     if model_name == "gpt-transcribe":
@@ -2313,12 +2333,18 @@ def _transcribe_openai(
                     transcription = _create_transcription(converted_path)
 
             transcript_text = _extract_transcript_text(transcription)
+            metadata = _extract_transcription_metadata(transcription)
             logger.info(
                 "Transcribed %s via %s (%s, %d chars)",
                 Path(file_path).name, provider_label, model_name, len(transcript_text),
             )
 
-            return {"success": True, "transcript": transcript_text, "provider": provider_label}
+            return {
+                "success": True,
+                "transcript": transcript_text,
+                "provider": provider_label,
+                **metadata,
+            }
         finally:
             close = getattr(client, "close", None)
             if callable(close):
@@ -2387,7 +2413,12 @@ def _transcribe_mistral(
                 "Transcribed %s via Mistral API (%s, %d chars)",
                 Path(file_path).name, model_name, len(transcript_text),
             )
-            return {"success": True, "transcript": transcript_text, "provider": "mistral"}
+            return {
+                "success": True,
+                "transcript": transcript_text,
+                "provider": "mistral",
+                **_extract_transcription_metadata(result),
+            }
 
     except PermissionError:
         return {"success": False, "transcript": "", "error": f"Permission denied: {file_path}"}
@@ -2557,7 +2588,14 @@ def _transcribe_xai(
             len(transcript_text),
         )
 
-        return {"success": True, "transcript": transcript_text, "provider": "xai"}
+        return {
+            "success": True,
+            "transcript": transcript_text,
+            "provider": "xai",
+            "language": result.get("language") or language or None,
+            "duration": result.get("duration"),
+            "segments": result.get("segments") or [],
+        }
 
     except PermissionError:
         return {"success": False, "transcript": "", "error": f"Permission denied: {file_path}"}
@@ -2659,7 +2697,17 @@ def _transcribe_elevenlabs(
             len(transcript_text),
         )
 
-        return {"success": True, "transcript": transcript_text, "provider": "elevenlabs"}
+        return {
+            "success": True,
+            "transcript": transcript_text,
+            "provider": "elevenlabs",
+            "language": (
+                result.get("language_code")
+                or result.get("language")
+                or language_code
+                or None
+            ),
+        }
 
     except PermissionError:
         return {"success": False, "transcript": "", "error": f"Permission denied: {file_path}"}
@@ -2904,6 +2952,9 @@ def _transcribe_prepared_audio(
     file_path: str,
     model: Optional[str] = None,
     source: Optional[str] = None,
+    *,
+    language: Optional[str] = None,
+    prompt: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Transcribe an audio file using the configured STT provider.
@@ -2918,6 +2969,8 @@ def _transcribe_prepared_audio(
         source:    Optional caller-surface label (e.g. ``"gateway"``,
                    ``"voice_mode"``) forwarded to the ``pre_transcription``
                    plugin hook for observability. Not used for dispatch.
+        language:  Optional request-level language hint.
+        prompt:    Optional request-level vocabulary/context hint.
 
     Returns:
         dict with keys:
@@ -2978,7 +3031,15 @@ def _transcribe_prepared_audio(
             trim_cleanup_dir = os.path.dirname(trimmed)
 
     try:
-        return _dispatch_stt_provider(file_path, provider, stt_config, model, source)
+        return _dispatch_stt_provider(
+            file_path,
+            provider,
+            stt_config,
+            model,
+            source,
+            language=language,
+            prompt=prompt,
+        )
     finally:
         if trim_cleanup_dir:
             shutil.rmtree(trim_cleanup_dir, ignore_errors=True)
@@ -2990,13 +3051,23 @@ def _dispatch_stt_provider(
     stt_config: Dict[str, Any],
     model: Optional[str] = None,
     source: Optional[str] = None,
+    *,
+    language: Optional[str] = None,
+    prompt: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Route *file_path* to the handler for *provider* (built-in > command > plugin)."""
-    # Optional static transcription prompt (``stt.prompt`` in config.yaml):
-    # vocabulary/context hints threaded to prompt-capable backends.
-    # Ordering: config is the base; pre_transcription hook results mutate on
-    # top, in registration order, so the last hook to set a field wins.
-    prompt = stt_config.get("prompt")
+    # Request hints override static config; hooks may then mutate either value.
+    if not isinstance(language, str) or not language.strip():
+        language = _get_stt_section(stt_config, provider).get("language")
+    elif language:
+        language = language.strip()
+
+    # Optional static transcription prompt (``stt.prompt`` in config.yaml)
+    # supplies the base when the caller did not provide one.
+    if not isinstance(prompt, str) or not prompt.strip():
+        prompt = stt_config.get("prompt")
+    # Ordering: config is the base, request hints override config, and
+    # pre_transcription hook results mutate on top in registration order.
     if not isinstance(prompt, str) or not prompt.strip():
         prompt = None
 
@@ -3004,13 +3075,12 @@ def _dispatch_stt_provider(
     # BEFORE any backend (built-in, command-type, or plugin-registered) is
     # invoked. Hooks may mutate prompt/language/model; file_path is
     # read-only. The helper short-circuits on has_hook() so the no-hook
-    # dispatch path stays byte-identical. ``language`` stays None unless a
-    # hook overrides it — backends keep their own config/env resolution.
+    # dispatch path avoids plugin work.
     model, language, prompt = _apply_pre_transcription_hook(
         file_path=file_path,
         provider=provider,
         model=model,
-        language=_get_stt_section(stt_config, provider).get("language"),
+        language=language,
         prompt=prompt,
         source=source,
     )
@@ -3154,12 +3224,18 @@ def transcribe_audio(
     file_path: str,
     model: Optional[str] = None,
     source: Optional[str] = None,
+    *,
+    language: Optional[str] = None,
+    prompt: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Safely validate, preprocess supported inputs, and dispatch transcription.
 
     ``source`` is an optional caller-surface label (e.g. ``"gateway"``,
     ``"voice_mode"``) forwarded to the ``pre_transcription`` plugin hook for
     observability. Not used for dispatch.
+
+    ``language`` and ``prompt`` are optional request-level overrides. They take
+    precedence over static STT config and remain subject to plugin transforms.
     """
     # Refuse to feed a credential / secret store (auth.json, .env, OAuth
     # tokens, mcp-tokens/, ...) to an STT provider — before ANY validation or
@@ -3192,7 +3268,13 @@ def transcribe_audio(
         prepared_error = _validate_audio_file(prepared_path, enforce_size_limit=False)
         if prepared_error:
             return prepared_error
-        return _transcribe_prepared_audio(prepared_path, model, source)
+        return _transcribe_prepared_audio(
+            prepared_path,
+            model,
+            source,
+            language=language,
+            prompt=prompt,
+        )
     finally:
         if cleanup_dir:
             shutil.rmtree(cleanup_dir, ignore_errors=True)
@@ -3323,3 +3405,40 @@ def _extract_transcript_text(transcription: Any) -> str:
         text = match.group("text").strip()
 
     return text
+
+
+def _extract_transcription_metadata(transcription: Any) -> Dict[str, Any]:
+    """Return common STT metadata fields from SDK objects or JSON dicts."""
+    metadata: Dict[str, Any] = {}
+    for key in ("language", "duration", "segments"):
+        value = None
+        if isinstance(transcription, dict):
+            value = transcription.get(key)
+        if value is None and hasattr(transcription, key):
+            value = getattr(transcription, key)
+        if key == "segments" and isinstance(value, list):
+            normalized_segments = []
+            for segment in value:
+                if isinstance(segment, dict):
+                    normalized_segments.append(segment)
+                    continue
+                model_dump = getattr(segment, "model_dump", None)
+                if callable(model_dump):
+                    dumped = model_dump()
+                    if isinstance(dumped, dict):
+                        normalized_segments.append(dumped)
+                        continue
+                to_dict = getattr(segment, "dict", None)
+                if callable(to_dict):
+                    dumped = to_dict()
+                    if isinstance(dumped, dict):
+                        normalized_segments.append(dumped)
+                        continue
+                if hasattr(segment, "__dict__"):
+                    normalized_segments.append(dict(vars(segment)))
+                    continue
+                normalized_segments.append(str(segment))
+            value = normalized_segments
+        if value not in (None, ""):
+            metadata[key] = value
+    return metadata

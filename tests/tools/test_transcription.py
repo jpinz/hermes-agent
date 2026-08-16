@@ -133,6 +133,8 @@ class TestTranscribeLocal:
 
         assert result["success"] is True
         assert result["transcript"] == "Hello world"
+        assert result["language"] == "en"
+        assert result["duration"] == 2.5
 
 
     def test_not_installed(self):
@@ -176,6 +178,37 @@ class TestTranscribeOpenAI:
 
         assert result["success"] is True
         assert "language" not in mock_client.audio.transcriptions.create.call_args.kwargs
+
+    def test_whisper_metadata_is_preserved(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("VOICE_TOOLS_OPENAI_KEY", "sk-test")
+        audio_file = tmp_path / "test.wav"
+        audio_file.write_bytes(b"fake audio")
+
+        class _SDKSegment:
+            def model_dump(self):
+                return {"text": "Bonjour"}
+
+        mock_client = MagicMock()
+        mock_client.audio.transcriptions.create.return_value = SimpleNamespace(
+            text="Bonjour",
+            language="fr",
+            duration=1.25,
+            segments=[_SDKSegment()],
+        )
+
+        with patch("tools.transcription_tools._HAS_OPENAI", True), \
+             patch("tools.transcription_tools._load_stt_config", return_value={}), \
+             patch("openai.OpenAI", return_value=mock_client):
+            from tools.transcription_tools import _transcribe_openai
+            result = _transcribe_openai(str(audio_file), "whisper-1")
+
+        create_kwargs = mock_client.audio.transcriptions.create.call_args.kwargs
+        assert create_kwargs["response_format"] == "verbose_json"
+        assert result["success"] is True
+        assert result["transcript"] == "Bonjour"
+        assert result["language"] == "fr"
+        assert result["duration"] == 1.25
+        assert result["segments"] == [{"text": "Bonjour"}]
 
 
 # ---------------------------------------------------------------------------
