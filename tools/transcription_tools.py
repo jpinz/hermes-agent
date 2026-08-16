@@ -3416,6 +3416,29 @@ def _extract_transcription_metadata(transcription: Any) -> Dict[str, Any]:
             value = transcription.get(key)
         if value is None and hasattr(transcription, key):
             value = getattr(transcription, key)
+        if key == "segments" and isinstance(value, list):
+            normalized_segments = []
+            for segment in value:
+                if isinstance(segment, dict):
+                    normalized_segments.append(segment)
+                    continue
+                model_dump = getattr(segment, "model_dump", None)
+                if callable(model_dump):
+                    dumped = model_dump()
+                    if isinstance(dumped, dict):
+                        normalized_segments.append(dumped)
+                        continue
+                to_dict = getattr(segment, "dict", None)
+                if callable(to_dict):
+                    dumped = to_dict()
+                    if isinstance(dumped, dict):
+                        normalized_segments.append(dumped)
+                        continue
+                if hasattr(segment, "__dict__"):
+                    normalized_segments.append(dict(vars(segment)))
+                    continue
+                normalized_segments.append(str(segment))
+            value = normalized_segments
         if value not in (None, ""):
             metadata[key] = value
     return metadata

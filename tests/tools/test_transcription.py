@@ -184,12 +184,16 @@ class TestTranscribeOpenAI:
         audio_file = tmp_path / "test.wav"
         audio_file.write_bytes(b"fake audio")
 
+        class _SDKSegment:
+            def model_dump(self):
+                return {"text": "Bonjour"}
+
         mock_client = MagicMock()
         mock_client.audio.transcriptions.create.return_value = SimpleNamespace(
             text="Bonjour",
             language="fr",
             duration=1.25,
-            segments=[{"text": "Bonjour"}],
+            segments=[_SDKSegment()],
         )
 
         with patch("tools.transcription_tools._HAS_OPENAI", True), \
