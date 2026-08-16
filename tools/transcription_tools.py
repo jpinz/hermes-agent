@@ -1009,6 +1009,7 @@ def _transcribe_command_stt(
         "success": True,
         "transcript": transcript_text,
         "provider": provider_name,
+        "language": language,
     }
 
 
@@ -1987,7 +1988,13 @@ def _transcribe_local(
         if idle_timeout > 0:
             _start_idle_unload_watcher(idle_timeout)
 
-        return {"success": True, "transcript": transcript, "provider": "local"}
+        return {
+            "success": True,
+            "transcript": transcript,
+            "provider": "local",
+            "language": getattr(info, "language", None) or language,
+            "duration": getattr(info, "duration", None),
+        }
 
     except Exception as e:
         logger.error("Local transcription failed: %s", e, exc_info=True)
@@ -2122,7 +2129,12 @@ def _transcribe_local_command(
                 normalized_model,
                 len(transcript_text),
             )
-            return {"success": True, "transcript": transcript_text, "provider": "local_command"}
+            return {
+                "success": True,
+                "transcript": transcript_text,
+                "provider": "local_command",
+                "language": language,
+            }
 
     except KeyError as e:
         return {
@@ -2196,7 +2208,12 @@ def _transcribe_groq(
             logger.info("Transcribed %s via Groq API (%s, lang=%s, %d chars)",
                          Path(file_path).name, model_name, language or "auto", len(transcript_text))
 
-            return {"success": True, "transcript": transcript_text, "provider": "groq"}
+            return {
+                "success": True,
+                "transcript": transcript_text,
+                "provider": "groq",
+                "language": language,
+            }
         finally:
             close = getattr(client, "close", None)
             if callable(close):
@@ -2274,7 +2291,11 @@ def _transcribe_openai(
                 create_kwargs = {
                     "model": model_name,
                     "file": audio_file,
-                    "response_format": "text" if model_name == "whisper-1" else "json",
+                    "response_format": (
+                        "verbose_json"
+                        if provider_label == "openai" and model_name == "whisper-1"
+                        else "json"
+                    ),
                 }
                 if language:
                     if model_name == "gpt-transcribe":
@@ -2312,12 +2333,18 @@ def _transcribe_openai(
                     transcription = _create_transcription(converted_path)
 
             transcript_text = _extract_transcript_text(transcription)
+            metadata = _extract_transcription_metadata(transcription)
             logger.info(
                 "Transcribed %s via %s (%s, %d chars)",
                 Path(file_path).name, provider_label, model_name, len(transcript_text),
             )
 
-            return {"success": True, "transcript": transcript_text, "provider": provider_label}
+            return {
+                "success": True,
+                "transcript": transcript_text,
+                "provider": provider_label,
+                **metadata,
+            }
         finally:
             close = getattr(client, "close", None)
             if callable(close):
@@ -2386,7 +2413,12 @@ def _transcribe_mistral(
                 "Transcribed %s via Mistral API (%s, %d chars)",
                 Path(file_path).name, model_name, len(transcript_text),
             )
-            return {"success": True, "transcript": transcript_text, "provider": "mistral"}
+            return {
+                "success": True,
+                "transcript": transcript_text,
+                "provider": "mistral",
+                **_extract_transcription_metadata(result),
+            }
 
     except PermissionError:
         return {"success": False, "transcript": "", "error": f"Permission denied: {file_path}"}
@@ -2556,7 +2588,14 @@ def _transcribe_xai(
             len(transcript_text),
         )
 
-        return {"success": True, "transcript": transcript_text, "provider": "xai"}
+        return {
+            "success": True,
+            "transcript": transcript_text,
+            "provider": "xai",
+            "language": result.get("language") or language or None,
+            "duration": result.get("duration"),
+            "segments": result.get("segments") or [],
+        }
 
     except PermissionError:
         return {"success": False, "transcript": "", "error": f"Permission denied: {file_path}"}
@@ -2658,7 +2697,17 @@ def _transcribe_elevenlabs(
             len(transcript_text),
         )
 
-        return {"success": True, "transcript": transcript_text, "provider": "elevenlabs"}
+        return {
+            "success": True,
+            "transcript": transcript_text,
+            "provider": "elevenlabs",
+            "language": (
+                result.get("language_code")
+                or result.get("language")
+                or language_code
+                or None
+            ),
+        }
 
     except PermissionError:
         return {"success": False, "transcript": "", "error": f"Permission denied: {file_path}"}
@@ -3356,3 +3405,17 @@ def _extract_transcript_text(transcription: Any) -> str:
         text = match.group("text").strip()
 
     return text
+
+
+def _extract_transcription_metadata(transcription: Any) -> Dict[str, Any]:
+    """Return common STT metadata fields from SDK objects or JSON dicts."""
+    metadata: Dict[str, Any] = {}
+    for key in ("language", "duration", "segments"):
+        value = None
+        if isinstance(transcription, dict):
+            value = transcription.get(key)
+        if value is None and hasattr(transcription, key):
+            value = getattr(transcription, key)
+        if value not in (None, ""):
+            metadata[key] = value
+    return metadata

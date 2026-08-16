@@ -1064,6 +1064,7 @@ class TestAudioTranscriptionsEndpoint:
             "success": True,
             "transcript": "hello world",
             "provider": "openai",
+            "language": "fr",
         }
         async with TestClient(TestServer(app)) as cli:
             with patch(
@@ -1092,17 +1093,56 @@ class TestAudioTranscriptionsEndpoint:
                     "/v1/audio/transcriptions",
                     data=_audio_form(
                         model="whisper-1",
-                        language="en",
                         response_format="verbose_json",
                     ),
                 )
                 assert verbose_resp.status == 200
                 assert await verbose_resp.json() == {
-                    "language": "en",
+                    "language": "fr",
                     "duration": 2.5,
                     "text": "hello world",
                     "segments": [],
                 }
+
+    @pytest.mark.asyncio
+    async def test_rejects_when_concurrent_run_limit_is_reached(self, adapter):
+        adapter._max_concurrent_runs = 1
+        adapter._inflight_agent_runs = 1
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch("tools.transcription_tools.transcribe_audio") as transcribe:
+                resp = await cli.post(
+                    "/v1/audio/transcriptions",
+                    data=_audio_form(model="whisper-1"),
+                )
+                body = await resp.json()
+
+        assert resp.status == 429
+        assert body["error"]["code"] == "rate_limit_exceeded"
+        transcribe.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_rejects_multipart_errors_during_iteration(self, adapter):
+        class _BrokenReader:
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                raise ValueError("malformed multipart boundary")
+
+        class _Request:
+            content_type = "multipart/form-data"
+            headers = {}
+            match_info = {}
+
+            async def multipart(self):
+                return _BrokenReader()
+
+        resp = await adapter._handle_audio_transcriptions(_Request())
+        body = json.loads(resp.text)
+
+        assert resp.status == 400
+        assert body["error"]["code"] == "invalid_multipart_body"
 
     @pytest.mark.asyncio
     async def test_rejects_invalid_multipart_fields(self, adapter):

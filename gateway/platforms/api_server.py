@@ -4142,13 +4142,14 @@ class APIServerAdapter(BasePlatformAdapter):
             "runtime": runtime,
         })
 
+    @_admit_api_agent_request
     async def _handle_audio_transcriptions(
         self, request: "web.Request"
     ) -> "web.Response":
         """POST /v1/audio/transcriptions — OpenAI Audio API format."""
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
+        limited = self._concurrency_limited_response()
+        if limited is not None:
+            return limited
 
         temp_path = ""
         try:
@@ -4164,7 +4165,50 @@ class APIServerAdapter(BasePlatformAdapter):
 
             try:
                 reader = await request.multipart()
-            except (AssertionError, ValueError):
+                fields: Dict[str, str] = {}
+                upload_size = 0
+                async for part in reader:
+                    if part.name == "file":
+                        if temp_path:
+                            return web.json_response(
+                                _openai_error(
+                                    "Only one 'file' field is supported.",
+                                    param="file",
+                                    code="duplicate_file",
+                                ),
+                                status=400,
+                            )
+                        suffix = _audio_upload_suffix(
+                            part.filename, part.headers.get("Content-Type")
+                        )
+                        with tempfile.NamedTemporaryFile(
+                            prefix="hermes-api-stt-",
+                            suffix=suffix,
+                            delete=False,
+                        ) as tmp:
+                            temp_path = tmp.name
+                            while True:
+                                chunk = await part.read_chunk(size=64 * 1024)
+                                if not chunk:
+                                    break
+                                upload_size += len(chunk)
+                                if upload_size > MAX_AUDIO_UPLOAD_BYTES:
+                                    return web.json_response(
+                                        _openai_error(
+                                            "Audio file is too large (maximum 25 MB).",
+                                            param="file",
+                                            code="file_too_large",
+                                        ),
+                                        status=413,
+                                    )
+                                tmp.write(chunk)
+                        continue
+
+                    if part.name in {"model", "language", "prompt", "response_format"}:
+                        fields[part.name] = await part.text()
+                    else:
+                        await part.release()
+            except (AssertionError, ValueError, web.HTTPBadRequest):
                 return web.json_response(
                     _openai_error(
                         "Invalid multipart request body.",
@@ -4172,50 +4216,6 @@ class APIServerAdapter(BasePlatformAdapter):
                     ),
                     status=400,
                 )
-
-            fields: Dict[str, str] = {}
-            upload_size = 0
-            async for part in reader:
-                if part.name == "file":
-                    if temp_path:
-                        return web.json_response(
-                            _openai_error(
-                                "Only one 'file' field is supported.",
-                                param="file",
-                                code="duplicate_file",
-                            ),
-                            status=400,
-                        )
-                    suffix = _audio_upload_suffix(
-                        part.filename, part.headers.get("Content-Type")
-                    )
-                    with tempfile.NamedTemporaryFile(
-                        prefix="hermes-api-stt-",
-                        suffix=suffix,
-                        delete=False,
-                    ) as tmp:
-                        temp_path = tmp.name
-                        while True:
-                            chunk = await part.read_chunk(size=64 * 1024)
-                            if not chunk:
-                                break
-                            upload_size += len(chunk)
-                            if upload_size > MAX_AUDIO_UPLOAD_BYTES:
-                                return web.json_response(
-                                    _openai_error(
-                                        "Audio file is too large (maximum 25 MB).",
-                                        param="file",
-                                        code="file_too_large",
-                                    ),
-                                    status=413,
-                                )
-                            tmp.write(chunk)
-                    continue
-
-                if part.name in {"model", "language", "prompt", "response_format"}:
-                    fields[part.name] = await part.text()
-                else:
-                    await part.release()
 
             if not temp_path:
                 return web.json_response(
